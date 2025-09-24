@@ -27,6 +27,14 @@ function graphClientFromReq(req: Request) {
   return Client.init({ authProvider: (done) => done(null, token) })
 }
 
+/** ====== NOVO: client fora do ciclo da request (ex.: pipeline) ====== */
+const { MS_GRAPH_TEST_TOKEN = '' } = process.env
+function clientFromToken(token?: string) {
+  const tk = (token || MS_GRAPH_TEST_TOKEN || '').trim()
+  if (!tk) throw new Error('Faltou token do Microsoft Graph (MS_GRAPH_TEST_TOKEN ou parâmetro)')
+  return Client.init({ authProvider: (done) => done(null, tk) })
+}
+
 /* ================= OneDrive ================= */
 
 async function ensureFolder(client: Client, folderPath: string): Promise<{ id: string }> {
@@ -112,6 +120,18 @@ async function downloadAsBuffer(client: Client, path: string): Promise<Buffer | 
     if (e?.statusCode === 404) return null
     throw e
   }
+}
+
+/** ====== NOVO: baixar por ID (para o pipeline) ====== */
+async function downloadById(client: Client, fileId: string): Promise<Buffer> {
+  const stream: any = await client.api(`/me/drive/items/${encodeURIComponent(fileId)}/content`).getStream()
+  const chunks: Buffer[] = []
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (c: Buffer) => chunks.push(c))
+    stream.on('end', () => resolve())
+    stream.on('error', reject)
+  })
+  return Buffer.concat(chunks)
 }
 
 /* ================= Excel (XLSX em memória) ================= */
@@ -217,4 +237,63 @@ export function msGraphRouter() {
   })
 
   return router
+}
+
+/* ========================================================================
+ *                    EXPORTS PARA O PIPELINE (excel.ts)
+ *  As funções abaixo são usadas pelo excel.ts e pelo adapter ./graph.ts
+ * ===================================================================== */
+
+export type InboxItem = { id: string; name: string; webUrl?: string }
+
+// Garante PaperMind/Inbox, PaperMind/Processed e PaperMind/Erros
+export async function ensurePaperMindFolders(token?: string): Promise<void> {
+  const client = clientFromToken(token)
+  await ensureFolder(client, 'PaperMind')
+  await ensureFolder(client, 'PaperMind/Inbox')
+  await ensureFolder(client, 'PaperMind/Processed')
+  await ensureFolder(client, 'PaperMind/Erros')
+}
+
+// Lista o primeiro PDF em PaperMind/Inbox
+export async function listInboxFirstPdf(token?: string): Promise<InboxItem | null> {
+  const client = clientFromToken(token)
+  await ensurePaperMindFolders(token)
+
+  const resp = await client.api(`/me/drive/root:/PaperMind/Inbox:/children`).get()
+  const items: any[] = resp?.value || []
+
+  const pdf = items.find(
+    (it) =>
+      it?.file &&
+      (it?.file?.mimeType === 'application/pdf' ||
+        String(it?.name || '').toLowerCase().endsWith('.pdf'))
+  )
+
+  if (!pdf) return null
+  return { id: String(pdf.id), name: String(pdf.name), webUrl: pdf.webUrl }
+}
+
+// Baixa pelo ID (Buffer)
+export async function downloadFileBuffer(fileId: string, token?: string): Promise<Buffer> {
+  const client = clientFromToken(token)
+  return await downloadById(client, fileId)
+}
+
+// Move para Processed
+export async function moveFileToProcessed(fileId: string, token?: string): Promise<void> {
+  const client = clientFromToken(token)
+  const dest = await client.api(`/me/drive/root:/PaperMind/Processed`).get()
+  await client.api(`/me/drive/items/${encodeURIComponent(fileId)}`).patch({
+    parentReference: { id: dest.id },
+  })
+}
+
+// Move para Erros
+export async function moveFileToErrors(fileId: string, token?: string): Promise<void> {
+  const client = clientFromToken(token)
+  const dest = await client.api(`/me/drive/root:/PaperMind/Erros`).get()
+  await client.api(`/me/drive/items/${encodeURIComponent(fileId)}`).patch({
+    parentReference: { id: dest.id },
+  })
 }
